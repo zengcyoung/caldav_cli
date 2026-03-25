@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import uuid
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone, tzinfo
+import zoneinfo
 from typing import Optional
 
 import caldav
@@ -44,17 +45,55 @@ def resolve_calendar(
 # ── Event helpers ────────────────────────────────────────────────────────────
 
 
-def _parse_dt(value: str) -> datetime:
-    """Parse ISO datetime or date string into a timezone-aware datetime."""
-    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+def _parse_dt(value: str, tz: str | None = None) -> datetime:
+    """Parse ISO datetime or date string into a timezone-aware datetime.
+
+    Timezone resolution order:
+    1. Explicit offset in value (e.g. 2024-06-01T14:30+09:00)
+    2. `tz` argument (IANA name, e.g. 'Asia/Shanghai')
+    3. CALDAV_TIMEZONE env var (IANA name)
+    4. System local timezone
+    """
+    import os
+
+    # Try parsing with explicit timezone offset first (e.g. +08:00)
+    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M%z"):
         try:
-            dt = datetime.strptime(value, fmt)
-            if fmt == "%Y-%m-%d":
-                dt = datetime.combine(dt.date(), datetime.min.time())
-            return dt.replace(tzinfo=timezone.utc)
+            return datetime.strptime(value, fmt)
         except ValueError:
             continue
-    raise ValueError(f"Cannot parse datetime: '{value}'. Use YYYY-MM-DD or YYYY-MM-DDTHH:MM")
+
+    # Parse naive datetime or date
+    dt: datetime | None = None
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            parsed = datetime.strptime(value, fmt)
+            if fmt == "%Y-%m-%d":
+                dt = datetime.combine(parsed.date(), datetime.min.time())
+            else:
+                dt = parsed
+            break
+        except ValueError:
+            continue
+
+    if dt is None:
+        raise ValueError(
+            f"Cannot parse datetime: '{value}'. "
+            "Use YYYY-MM-DD, YYYY-MM-DDTHH:MM, or YYYY-MM-DDTHH:MM+HH:MM"
+        )
+
+    # Resolve timezone
+    tz_name = tz or os.environ.get("CALDAV_TIMEZONE")
+    if tz_name:
+        try:
+            local_tz = zoneinfo.ZoneInfo(tz_name)
+            return dt.replace(tzinfo=local_tz)
+        except zoneinfo.ZoneInfoNotFoundError:
+            raise ValueError(f"Unknown timezone: '{tz_name}'. Use IANA names like 'Asia/Shanghai'.")
+
+    # Fall back to system local timezone
+    local_tz = datetime.now().astimezone().tzinfo
+    return dt.replace(tzinfo=local_tz)
 
 
 def _event_to_dict(vevent) -> dict:
@@ -110,10 +149,11 @@ def create_event(
     end: str | None = None,
     description: str | None = None,
     location: str | None = None,
+    tz: str | None = None,
 ) -> str:
     """Create an event. Returns the new UID."""
-    dt_start = _parse_dt(start)
-    dt_end = _parse_dt(end) if end else dt_start + timedelta(hours=1)
+    dt_start = _parse_dt(start, tz=tz)
+    dt_end = _parse_dt(end, tz=tz) if end else dt_start + timedelta(hours=1)
     uid = str(uuid.uuid4())
 
     cal = Calendar()
@@ -158,6 +198,7 @@ def update_event(
     end: str | None = None,
     description: str | None = None,
     location: str | None = None,
+    tz: str | None = None,
 ) -> None:
     """Update an existing event by UID."""
     obj = _find_event_obj(calendar, uid)
@@ -168,9 +209,9 @@ def update_event(
             if summary is not None:
                 component["summary"] = summary
             if start is not None:
-                component["dtstart"] = caldav.vDatetime(_parse_dt(start))
+                component["dtstart"] = caldav.vDatetime(_parse_dt(start, tz=tz))
             if end is not None:
-                component["dtend"] = caldav.vDatetime(_parse_dt(end))
+                component["dtend"] = caldav.vDatetime(_parse_dt(end, tz=tz))
             if description is not None:
                 component["description"] = description
             if location is not None:

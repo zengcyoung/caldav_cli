@@ -27,7 +27,7 @@ def load_config() -> dict[str, str]:
         file_config = {k: v for k, v in dotenv_values(CONFIG_FILE).items() if v is not None}
 
     # Env vars override file
-    env_keys = ("CALDAV_URL", "CALDAV_USERNAME", "CALDAV_PASSWORD", "CALDAV_CALENDAR")
+    env_keys = ("CALDAV_URL", "CALDAV_USERNAME", "CALDAV_PASSWORD", "CALDAV_CALENDAR", "CALDAV_TIMEZONE")
     for key in env_keys:
         val = os.environ.get(key)
         if val is not None:
@@ -48,7 +48,8 @@ def get_credentials() -> tuple[str, str, str]:
             "  CALDAV_URL=https://nextcloud.example.com/remote.php/dav\n"
             "  CALDAV_USERNAME=youruser\n"
             "  CALDAV_PASSWORD=yourapppassword\n"
-            "  CALDAV_CALENDAR=personal  # optional, uses default calendar if unset"
+            "  CALDAV_CALENDAR=personal  # optional, uses default calendar if unset\n"
+            "  CALDAV_TIMEZONE=Asia/Shanghai  # optional, falls back to system tz"
         )
     return config["CALDAV_URL"], config["CALDAV_USERNAME"], config["CALDAV_PASSWORD"]
 

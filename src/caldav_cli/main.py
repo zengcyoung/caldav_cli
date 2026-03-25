@@ -5,16 +5,17 @@ QUICK REFERENCE (for AI agents):
   caldav_cli calendars              List all calendars
   caldav_cli events [--start DATE] [--end DATE] [--calendar NAME]
                                     List events (default: today +30 days)
-  caldav_cli add SUMMARY --start DATETIME [--end DATETIME] [--desc TEXT] [--location TEXT] [--calendar NAME]
+  caldav_cli add SUMMARY --start DATETIME [--end DATETIME] [--desc TEXT] [--location TEXT] [--tz TIMEZONE] [--calendar NAME]
                                     Create a new event
   caldav_cli show UID               Show full details of one event
-  caldav_cli update UID [--summary TEXT] [--start DT] [--end DT] [--desc TEXT] [--location TEXT]
+  caldav_cli update UID [--summary TEXT] [--start DT] [--end DT] [--desc TEXT] [--location TEXT] [--tz TIMEZONE]
                                     Update an event (omit fields to leave unchanged)
   caldav_cli delete UID [--yes]     Delete an event by UID
   caldav_cli config                 Show config file path and credential status
   caldav_cli setup                  Interactive wizard to write ~/.config/caldav_cli/config.env
 
-DATE FORMAT: YYYY-MM-DD or YYYY-MM-DDTHH:MM (e.g. 2024-06-01T14:30)
+DATE FORMAT: YYYY-MM-DD or YYYY-MM-DDTHH:MM or YYYY-MM-DDTHH:MM+HH:MM (e.g. 2024-06-01T14:30+08:00)
+TIMEZONE: IANA name (e.g. Asia/Shanghai, Asia/Tokyo). Falls back to CALDAV_TIMEZONE env var, then system local tz.
 UID: from 'events' or 'show' output — a UUID string identifying one event.
 """
 
@@ -158,10 +159,11 @@ def show(
 @app.command()
 def add(
     summary: str = typer.Argument(..., help="Event title/summary."),
-    start: str = typer.Option(..., "--start", "-s", help="Start datetime (YYYY-MM-DD or YYYY-MM-DDTHH:MM)."),
+    start: str = typer.Option(..., "--start", "-s", help="Start datetime (YYYY-MM-DD, YYYY-MM-DDTHH:MM, or YYYY-MM-DDTHH:MM+HH:MM)."),
     end: Optional[str] = typer.Option(None, "--end", "-e", help="End datetime. Default: start +1 hour."),
     description: Optional[str] = typer.Option(None, "--desc", "-d", help="Event description."),
     location: Optional[str] = typer.Option(None, "--location", "-l", help="Event location."),
+    tz: Optional[str] = typer.Option(None, "--tz", help="Timezone (IANA, e.g. Asia/Shanghai). Overrides CALDAV_TIMEZONE env var and system tz."),
     calendar: Optional[str] = typer.Option(None, "--calendar", "-c", help="Calendar name."),
 ):
     """Create a new calendar event.
@@ -169,11 +171,12 @@ def add(
     Examples:
 
       caldav_cli add "Team standup" --start 2024-06-03T09:00 --end 2024-06-03T09:30
+      caldav_cli add "Tokyo dinner" --start 2024-06-03T19:00 --tz Asia/Tokyo
       caldav_cli add "Birthday" --start 2024-06-15 --desc "Don't forget cake" --calendar personal
     """
     try:
         cal = _get_calendar(calendar)
-        uid = dav.create_event(cal, summary, start, end, description, location)
+        uid = dav.create_event(cal, summary, start, end, description, location, tz=tz)
         rprint(f"[green]✓ Event created.[/green] UID: [bold]{uid}[/bold]")
     except Exception as e:
         err.print(f"Error: {e}")
@@ -188,6 +191,7 @@ def update(
     end: Optional[str] = typer.Option(None, "--end", "-e", help="New end datetime."),
     description: Optional[str] = typer.Option(None, "--desc", "-d", help="New description."),
     location: Optional[str] = typer.Option(None, "--location", "-l", help="New location."),
+    tz: Optional[str] = typer.Option(None, "--tz", help="Timezone (IANA, e.g. Asia/Tokyo). Applied to --start and --end if they lack explicit offset."),
     calendar: Optional[str] = typer.Option(None, "--calendar", "-c", help="Calendar name."),
 ):
     """Update an existing event. Only provided fields are changed.
@@ -195,11 +199,11 @@ def update(
     Examples:
 
       caldav_cli update <UID> --summary "New title"
-      caldav_cli update <UID> --start 2024-06-03T10:00 --end 2024-06-03T11:00
+      caldav_cli update <UID> --start 2024-06-03T10:00 --end 2024-06-03T11:00 --tz Asia/Tokyo
     """
     try:
         cal = _get_calendar(calendar)
-        dav.update_event(cal, uid, summary, start, end, description, location)
+        dav.update_event(cal, uid, summary, start, end, description, location, tz=tz)
         rprint(f"[green]✓ Event updated.[/green]")
     except Exception as e:
         err.print(f"Error: {e}")
@@ -241,7 +245,7 @@ def config():
         # Check which keys are set without printing values
         from dotenv import dotenv_values
         keys = dotenv_values(path).keys()
-        for k in ("CALDAV_URL", "CALDAV_USERNAME", "CALDAV_PASSWORD", "CALDAV_CALENDAR"):
+        for k in ("CALDAV_URL", "CALDAV_USERNAME", "CALDAV_PASSWORD", "CALDAV_CALENDAR", "CALDAV_TIMEZONE"):
             mark = "[green]✓[/green]" if k in keys else "[dim]✗ (not set)[/dim]"
             rprint(f"  {mark} {k}")
     else:
@@ -259,6 +263,7 @@ def setup():
     username = typer.prompt("Username")
     password = typer.prompt("Password / App password", hide_input=True)
     calendar = typer.prompt("Default calendar name (leave blank to use first)", default="")
+    timezone_name = typer.prompt("Default timezone (IANA, e.g. Asia/Shanghai, leave blank to use system tz)", default="")
 
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.chmod(0o600) if CONFIG_FILE.exists() else None
@@ -270,6 +275,8 @@ def setup():
     ]
     if calendar:
         lines.append(f"CALDAV_CALENDAR={calendar}")
+    if timezone_name:
+        lines.append(f"CALDAV_TIMEZONE={timezone_name}")
 
     CONFIG_FILE.write_text("\n".join(lines) + "\n")
     CONFIG_FILE.chmod(0o600)
