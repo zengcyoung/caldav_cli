@@ -209,9 +209,13 @@ def update_event(
             if summary is not None:
                 component["summary"] = summary
             if start is not None:
-                component["dtstart"] = caldav.vDatetime(_parse_dt(start, tz=tz))
+                dt = _parse_dt(start, tz=tz)
+                component.pop("dtstart", None)
+                component.add("dtstart", dt)
             if end is not None:
-                component["dtend"] = caldav.vDatetime(_parse_dt(end, tz=tz))
+                dt = _parse_dt(end, tz=tz)
+                component.pop("dtend", None)
+                component.add("dtend", dt)
             if description is not None:
                 component["description"] = description
             if location is not None:
