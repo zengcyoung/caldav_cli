@@ -142,6 +142,15 @@ def fetch_events(
     return events
 
 
+def _unescape_text(value: str) -> str:
+    """Convert literal \\n sequences to real newlines.
+
+    Shell arguments pass '\\n' as two characters (backslash + n).
+    This converts them to actual newline characters before storing in iCal.
+    """
+    return value.replace("\\n", "\n")
+
+
 def create_event(
     calendar: caldav.Calendar,
     summary: str,
@@ -167,7 +176,7 @@ def create_event(
     event.add("dtend", dt_end)
     event.add("dtstamp", datetime.now(tz=timezone.utc))
     if description:
-        event.add("description", description)
+        event.add("description", _unescape_text(description))
     if location:
         event.add("location", location)
 
@@ -217,7 +226,7 @@ def update_event(
                 component.pop("dtend", None)
                 component.add("dtend", dt)
             if description is not None:
-                component["description"] = description
+                component["description"] = _unescape_text(description)
             if location is not None:
                 component["location"] = location
             break
