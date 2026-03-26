@@ -1,15 +1,25 @@
-"""CalDAV client helpers — connection, calendar resolution, event CRUD."""
+"""CalDAV client helpers — connection, calendar resolution, event CRUD.
+
+Timezone design (RFC 5545 compliant):
+- All datetimes are stored with IANA TZID (e.g. DTSTART;TZID=Asia/Tokyo:20260330T120000)
+- Fixed UTC offsets (+09:00) are mapped to canonical IANA names when possible
+- update_event inherits the original event's TZID when --tz is not specified
+- UTC offset fallback only used when no IANA mapping is found
+"""
 
 from __future__ import annotations
 
+import os
 import uuid
-from datetime import date, datetime, timedelta, timezone, tzinfo
-import zoneinfo
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
+import zoneinfo
 
 import caldav
 from icalendar import Calendar, Event
 
+
+# ── Connection ────────────────────────────────────────────────────────────────
 
 def connect(url: str, username: str, password: str) -> caldav.DAVClient:
     return caldav.DAVClient(url=url, username=username, password=password)
@@ -42,36 +52,118 @@ def resolve_calendar(
     return calendars[0]
 
 
-# ── Event helpers ────────────────────────────────────────────────────────────
+# ── Timezone helpers ──────────────────────────────────────────────────────────
+
+# Common UTC offset → IANA mapping for fallback
+_OFFSET_TO_IANA: dict[int, str] = {
+    -12: "Etc/GMT+12",
+    -11: "Pacific/Pago_Pago",
+    -10: "Pacific/Honolulu",
+    -9:  "America/Anchorage",
+    -8:  "America/Los_Angeles",
+    -7:  "America/Denver",
+    -6:  "America/Chicago",
+    -5:  "America/New_York",
+    -4:  "America/Halifax",
+    -3:  "America/Sao_Paulo",
+    -2:  "Atlantic/South_Georgia",
+    -1:  "Atlantic/Azores",
+     0:  "UTC",
+     1:  "Europe/Paris",
+     2:  "Europe/Helsinki",
+     3:  "Europe/Moscow",
+     4:  "Asia/Dubai",
+     5:  "Asia/Karachi",
+     6:  "Asia/Dhaka",
+     7:  "Asia/Bangkok",
+     8:  "Asia/Shanghai",
+     9:  "Asia/Tokyo",
+    10:  "Australia/Sydney",
+    11:  "Pacific/Noumea",
+    12:  "Pacific/Auckland",
+}
+
+
+def _offset_to_zoneinfo(offset_seconds: int) -> zoneinfo.ZoneInfo:
+    """Convert a UTC offset (seconds) to a ZoneInfo, preferring IANA names."""
+    hours = offset_seconds // 3600
+    iana = _OFFSET_TO_IANA.get(hours)
+    if iana:
+        return zoneinfo.ZoneInfo(iana)
+    # Fall back to Etc/GMT notation (note: sign is inverted)
+    sign = "+" if hours <= 0 else "-"
+    return zoneinfo.ZoneInfo(f"Etc/GMT{sign}{abs(hours)}")
+
+
+def _ensure_zoneinfo(dt: datetime) -> datetime:
+    """Ensure a datetime uses ZoneInfo (IANA) rather than a fixed UTC offset tzinfo.
+
+    This is important for RFC 5545 compliance: TZID must be an IANA name,
+    not a numeric offset like 'UTC+09:00'.
+    """
+    if dt.tzinfo is None:
+        return dt
+    # Already a ZoneInfo — no conversion needed
+    if isinstance(dt.tzinfo, zoneinfo.ZoneInfo):
+        return dt
+    # Convert fixed offset → ZoneInfo
+    offset = dt.utcoffset()
+    if offset is not None:
+        zi = _offset_to_zoneinfo(int(offset.total_seconds()))
+        return dt.replace(tzinfo=zi)
+    return dt
+
+
+def _get_event_tzid(component) -> str | None:
+    """Extract the TZID from a VEVENT's DTSTART property, if present."""
+    dtstart = component.get("dtstart")
+    if not dtstart:
+        return None
+    # Check params for explicit TZID
+    if hasattr(dtstart, "params") and "TZID" in dtstart.params:
+        tzid = dtstart.params["TZID"]
+        # Prefer it if it's a valid IANA name
+        try:
+            zoneinfo.ZoneInfo(tzid)
+            return tzid
+        except (zoneinfo.ZoneInfoNotFoundError, KeyError):
+            pass
+    # Check tzinfo on the datetime itself
+    dt = dtstart.dt
+    if isinstance(dt, datetime) and isinstance(dt.tzinfo, zoneinfo.ZoneInfo):
+        return dt.tzinfo.key
+    return None
 
 
 def _parse_dt(value: str, tz: str | None = None) -> datetime:
-    """Parse ISO datetime or date string into a timezone-aware datetime.
+    """Parse ISO datetime string into a ZoneInfo-aware datetime (RFC 5545 compliant).
 
     Timezone resolution order:
-    1. Explicit offset in value (e.g. 2024-06-01T14:30+09:00)
-    2. `tz` argument (IANA name, e.g. 'Asia/Shanghai')
-    3. CALDAV_TIMEZONE env var (IANA name)
-    4. System local timezone
+    1. `tz` argument (IANA name, e.g. 'Asia/Tokyo') — explicit override
+    2. CALDAV_TIMEZONE env var (IANA name)
+    3. Explicit offset in value (+09:00) → mapped to IANA via _OFFSET_TO_IANA
+    4. System local timezone → converted to ZoneInfo if possible
     """
-    import os
+    # Resolve explicit tz name first (overrides everything)
+    tz_name = tz or os.environ.get("CALDAV_TIMEZONE")
 
-    # Try parsing with explicit timezone offset first (e.g. +08:00)
+    # Try parsing with explicit timezone offset (e.g. 2026-03-30T12:00+09:00)
     for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M%z"):
         try:
-            return datetime.strptime(value, fmt)
+            dt = datetime.strptime(value, fmt)
+            if tz_name:
+                # Explicit tz overrides the offset in the string
+                return dt.replace(tzinfo=zoneinfo.ZoneInfo(tz_name))
+            return _ensure_zoneinfo(dt)
         except ValueError:
             continue
 
     # Parse naive datetime or date
-    dt: datetime | None = None
+    dt = None
     for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
         try:
             parsed = datetime.strptime(value, fmt)
-            if fmt == "%Y-%m-%d":
-                dt = datetime.combine(parsed.date(), datetime.min.time())
-            else:
-                dt = parsed
+            dt = datetime.combine(parsed.date(), datetime.min.time()) if fmt == "%Y-%m-%d" else parsed
             break
         except ValueError:
             continue
@@ -82,18 +174,25 @@ def _parse_dt(value: str, tz: str | None = None) -> datetime:
             "Use YYYY-MM-DD, YYYY-MM-DDTHH:MM, or YYYY-MM-DDTHH:MM+HH:MM"
         )
 
-    # Resolve timezone
-    tz_name = tz or os.environ.get("CALDAV_TIMEZONE")
     if tz_name:
         try:
-            local_tz = zoneinfo.ZoneInfo(tz_name)
-            return dt.replace(tzinfo=local_tz)
-        except zoneinfo.ZoneInfoNotFoundError:
+            return dt.replace(tzinfo=zoneinfo.ZoneInfo(tz_name))
+        except (zoneinfo.ZoneInfoNotFoundError, KeyError):
             raise ValueError(f"Unknown timezone: '{tz_name}'. Use IANA names like 'Asia/Shanghai'.")
 
-    # Fall back to system local timezone
-    local_tz = datetime.now().astimezone().tzinfo
-    return dt.replace(tzinfo=local_tz)
+    # Fall back to system local timezone, converted to ZoneInfo
+    local_dt = dt.astimezone()
+    return _ensure_zoneinfo(local_dt)
+
+
+# ── Event dict helpers ────────────────────────────────────────────────────────
+
+def _unescape_text(value: str) -> str:
+    """Convert literal \\n sequences to real newlines.
+
+    Shell arguments pass '\\n' as two characters (backslash + n).
+    """
+    return value.replace("\\n", "\n")
 
 
 def _event_to_dict(vevent) -> dict:
@@ -121,6 +220,8 @@ def _event_to_dict(vevent) -> dict:
     }
 
 
+# ── CRUD ──────────────────────────────────────────────────────────────────────
+
 def fetch_events(
     calendar: caldav.Calendar,
     start: str | None = None,
@@ -142,15 +243,6 @@ def fetch_events(
     return events
 
 
-def _unescape_text(value: str) -> str:
-    """Convert literal \\n sequences to real newlines.
-
-    Shell arguments pass '\\n' as two characters (backslash + n).
-    This converts them to actual newline characters before storing in iCal.
-    """
-    return value.replace("\\n", "\n")
-
-
 def create_event(
     calendar: caldav.Calendar,
     summary: str,
@@ -160,7 +252,7 @@ def create_event(
     location: str | None = None,
     tz: str | None = None,
 ) -> str:
-    """Create an event. Returns the new UID."""
+    """Create an event with RFC 5545 compliant TZID. Returns the new UID."""
     dt_start = _parse_dt(start, tz=tz)
     dt_end = _parse_dt(end, tz=tz) if end else dt_start + timedelta(hours=1)
     uid = str(uuid.uuid4())
@@ -187,7 +279,6 @@ def create_event(
 
 def _find_event_obj(calendar: caldav.Calendar, uid: str) -> caldav.CalendarObjectResource:
     """Find a CalDAV event object by UID."""
-    # Search broad range and match by UID
     start = datetime(2000, 1, 1, tzinfo=timezone.utc)
     end = datetime(2099, 12, 31, tzinfo=timezone.utc)
     for obj in calendar.date_search(start=start, end=end):
@@ -209,20 +300,29 @@ def update_event(
     location: str | None = None,
     tz: str | None = None,
 ) -> None:
-    """Update an existing event by UID."""
+    """Update an existing event by UID.
+
+    Timezone handling:
+    - If --tz is provided: use that IANA timezone for new start/end
+    - If --tz is not provided: inherit the original event's TZID
+    - This ensures we never silently change a local-time event to UTC
+    """
     obj = _find_event_obj(calendar, uid)
     cal = Calendar.from_ical(obj.data)
 
     for component in cal.walk():
         if component.name == "VEVENT" and str(component.get("uid", "")) == uid:
+            # Determine effective timezone: explicit --tz > original event TZID > CALDAV_TIMEZONE > system
+            effective_tz = tz or _get_event_tzid(component) or os.environ.get("CALDAV_TIMEZONE")
+
             if summary is not None:
                 component["summary"] = summary
             if start is not None:
-                dt = _parse_dt(start, tz=tz)
+                dt = _parse_dt(start, tz=effective_tz)
                 component.pop("dtstart", None)
                 component.add("dtstart", dt)
             if end is not None:
-                dt = _parse_dt(end, tz=tz)
+                dt = _parse_dt(end, tz=effective_tz)
                 component.pop("dtend", None)
                 component.add("dtend", dt)
             if description is not None:
@@ -239,3 +339,4 @@ def delete_event(calendar: caldav.Calendar, uid: str) -> None:
     """Delete an event by UID."""
     obj = _find_event_obj(calendar, uid)
     obj.delete()
+
